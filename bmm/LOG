@@ -1,0 +1,191 @@
+======------ 11/09/2012 ------======
+* Create a new pass called: EnforceMemMod. It puts fences to enforce the chosen memory model 
+  w.r.t. the architecture built for. No action is needed for BMM/IA32. A naive SC/IA32 is 
+  implemented.
+
+======------ 11/07/2012 ------======
+* How current Jikes handle volatiles: one fence every volatile store
+* Added memory model option in building. ant properties:
+   memory.model=JMM/BMM/SC
+   naive.memory.model=true/false
+
+   -- X86 - naive - BMM --
+   write_floor
+   putfield/putstatic/Xastore
+   fence
+
+   getfield/getstatic/Xaload
+   read_ceiling
+
+   Problem: the following translation does not prevent the reordering of the load and store.
+   volatile load … volatile_store  
+   =>
+   load [rc] … [wf] store [fnc]
+  
+asm.emitMFENCE();
+======------ 11/05/2012 ------======
+* SC/TSO violating opts
+ - LoopUnrolling: only run on O3
+ - LocalCSE: modified
+ - LoadElimination: only on O3
+ - LICM: only on O3
+
+  **** Optimizations & Their running level ****   
+   BC2HIR {
+    - ConvertBCtoHIR
+    - AdjustBCIndexes
+    - OsrPointConstructor (VM.runningVM && OSR_GUARDED_INLINING)
+    - BranchOptimizations
+    - AdjustBranchProbabilities
+   } // BC2HIR
+   
+   HIROptimizations {
+    ** CFG Transformations **
+    - TailRecursionElimination (1)
+      ** Basic Block Frequency Estimation ** (1)
+        - BuildLST
+        - EstimateBlockFrequencies
+    - StaticSplitting (CONTROL_STATIC_SPLITTING)  ??
+    - CFGTransformations
+	- DominatorsPhase
+    - LoopUnrolling: maybe problematic (3 && CONTROL_UNROLL_LOG >= 1 && !SSA_LOOP_VERSIONING)
+    - BranchOptimizations
+    ** CFG Structural Analysis **
+    - BuildLST
+    - YieldPoints
+    - EstimateBlockFrequencies
+    **
+    - Simple (d)
+    - EscapeTransformations (ESCAPE_MONITOR_REMOVAL || ESCAPE_SCALAR_REPLACE_AGGREGATES)
+      // 1. synchronization removal
+      // 2. scalar replacement of aggregates and short arrays
+	- SimpleEscape (ESCAPE_SIMPLE_IPA)
+    - BranchOptimizations
+    SSAinHIR {
+      ** Basic Block Frequency Estimation ** (O3)
+      ** HIR SSA transformations ** (O3)
+        - LocalCopyProp
+        - LocalConstantProp
+        - PiNodes
+        - BranchOptimizations
+        - DominatorsPhase
+        - DominanceFrontier
+        - LoadElimination(1-5)
+        > RedundantBranchElimination (SSA_REDUNDANT_BRANCH_ELIMINATION)
+          - EnsureSSA
+	  - GlobalValueNumber
+	  - RBE  // if (x > 1) { if (x >1) stmts;}
+        > SSATuneUp
+	  - TuneUpPreparation (SSA)
+	  - EnterSSA (SSA)
+	  - Simple (1)
+	  - FoldingDriver (SSA && SSA_EXPRESSION_FOLDING)
+        - PiNodes
+        > SSATuneUp
+        > GCP ** Global Code Placement ** (SSA_GCP || SSA_GCSE) (3)
+          - GCPPreparation
+          - EnterSSA
+          - GlobalCSE
+          - EnterSSA
+          - LICM (SSA_GCP): not ok, but will not be performed with default opt level
+          - GCPFinalization
+        - LoopVersioning (SSA_LOOP_VERSIONING)
+        - LeaveSSA
+      - CoalesceMoves (SSA_COALESCE_AFTER)
+      ** Post SSA cleanup ** (O3)
+        - LocalCopyProp
+        - LocalConstantProp
+        - Simple (3)
+        - EscapeTransformations
+        - BranchOptimizations
+    } // SSAinHIR
+    - LocalCopyProp
+    - LocalConstantProp
+    - LocalCSE: modified
+      Alg:
+       for store: cache the expr if not already
+       for load: 
+	1) r1=L(X); r2=L(X);  =>  r1'=L(X); r1=r1'; r2=r1';
+	2) S(X)=v ; r2=L(X);  =>  r1 =v   ; S(X)=v; r2=r1 ;
+
+    - FieldAnalysis (FIELD_ANALYSIS)
+    - InsertYieldpointCounters
+    - InsertInstructionCounters
+    - InsertMethodInvocationCounter
+   } // HIROptimizations
+   
+   HIR2LIR {
+    ** Convert HIR to LIR **
+    - ExpandRuntimeServices
+    - BranchOptimizations
+    - LocalCastOptimization
+    - ConvertHIRtoLIR
+    - BranchOptimizations
+    - AdjustBranchProbabilities
+   } // HIR2LIR
+   
+   LIROptimizations {
+    SSAinLIR {
+        ** Basic Block Frequency Estimation ** (O3)
+        ** LIR SSA transformations ** (O3)
+         - CFGTransformations (2 && CONTROL_TURN_WHILES_INTO_UNTILS)
+         - DominatorsPhase
+         - DominanceFrontier
+         > GCP
+         - LeaveSSA
+         **
+         - LiveRangeSplitting
+         - CoalesceMoves
+         ** Post SSA cleanup ** (O3)
+    } // SSAinLIR
+    - LocalCopyProp
+    - LocalConstantProp
+    - LocalCSE
+    - Simple
+    ** Basic Block Frequency Estimation **
+    - ReorderingPhase
+    - BranchOptimizations
+    - InstrumentationSamplingFramework
+    - LowerInstrumentation
+   } // LIROptimizations
+
+   LIR2MIR {
+    - SplitBasicBlock
+    - MutateSplits
+    > ConvertLIRtoMIR
+      - ReduceOperators
+      - ConvertALUOperators
+      - NormalizeConstantsPhase
+      - DoLiveness
+      - DoBURS
+      - ComplexOperators
+      - NullCheckCombining
+   } // LIR2MIR
+
+   MIROptimizations {
+    ** Register Mapping **
+    - MIRSplitRanges
+    - ExpandCallingConvention
+    - ExpandFPRStackConvention
+    - LiveAnalysis
+    - RegisterAllocator
+    - PrologueEpilogueCreator
+    **
+    - MIRBranchOptimizations
+   } // MIROptimizations
+
+   
+   MIR2MC {
+    > ConvertMIRtoMC
+    - FinalMIRExpansionDriver
+    - AssemblerDriver
+   } // MIR2MC
+
+BC
+HIR
+LIR
+MIR = asm
+MC = machinecode
+   
+   
+   
