@@ -432,6 +432,8 @@ public class OptimizationPlanner {
           }
         },
 
+        // Insert fences to enforce the chosen memory model
+        new EnforceMemMod(),
         // Inlining "runtime service" methods
         new ExpandRuntimeServices(),
         // Peephole branch optimizations
@@ -440,8 +442,6 @@ public class OptimizationPlanner {
         new LocalCastOptimization(),
         // Massive operator expansion
         new ConvertHIRtoLIR(),
-        // Insert fences to enforce the chosen memory model
-        new EnforceMemMod(),
         // Peephole branch optimizations
         new BranchOptimizations(0, true, true),
         // Adjust static branch probabilites to account for infrequent blocks

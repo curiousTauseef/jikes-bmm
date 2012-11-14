@@ -4,11 +4,16 @@ import static org.jikesrvm.compilers.opt.ir.Operators.FENCE;
 import static org.jikesrvm.compilers.opt.ir.Operators.FENCE_opcode;
 import static org.jikesrvm.compilers.opt.ir.Operators.MONITORENTER_opcode;
 import static org.jikesrvm.compilers.opt.ir.Operators.MONITOREXIT_opcode;
+import static org.jikesrvm.compilers.opt.ir.Operators.RETURN_opcode;
+import static org.jikesrvm.compilers.opt.ir.Operators.ATHROW_opcode;
+import static org.jikesrvm.compilers.opt.ir.Operators.CALL_opcode;
 
+import java.lang.reflect.Constructor;
 import java.util.Enumeration;
 
 import org.jikesrvm.VM;
 import org.jikesrvm.compilers.opt.LocalCSE;
+import org.jikesrvm.compilers.opt.OptOptions;
 import org.jikesrvm.compilers.opt.driver.CompilerPhase;
 import org.jikesrvm.compilers.opt.ir.BasicBlock;
 import org.jikesrvm.compilers.opt.ir.Empty;
@@ -18,6 +23,29 @@ import org.jikesrvm.compilers.opt.util.Stack;
 
 public class EnforceMemMod extends CompilerPhase {
 
+  private static final boolean DEBUG_IA32_SC_NAIVE = false;
+
+  @Override
+  public boolean shouldPerform(OptOptions options) {
+    return VM.MemoryModel != VM.JMM;
+  }
+
+  /**
+   * Constructor for this compiler phase
+   */
+  private static final Constructor<CompilerPhase> constructor =
+      getCompilerPhaseConstructor(EnforceMemMod.class, new Class[] {});
+
+  /**
+   * Get a constructor object for this compiler phase
+   * 
+   * @return compiler phase constructor
+   */
+  @Override
+  public Constructor<CompilerPhase> getClassConstructor() {
+    return constructor;
+  }
+
   @Override
   public String getName() {
     return "Chosen Memory Model Enforcement";
@@ -25,31 +53,35 @@ public class EnforceMemMod extends CompilerPhase {
 
   @Override
   public void perform(IR ir) {
+    if (VM.VerifyAssertions)
+      VM._assert(VM.MemoryModel != VM.JMM);
     if (VM.BuildForIA32 && (VM.MemoryModel == VM.BMM)
         && VM.MemoryModel_NaiveImpl)
       IA32_BMM_Naive(ir);
-    if (VM.BuildForIA32 && (VM.MemoryModel == VM.BMM)
+    else if (VM.BuildForIA32 && (VM.MemoryModel == VM.BMM)
         && !VM.MemoryModel_NaiveImpl)
       IA32_BMM(ir);
-    if (VM.BuildForIA32 && (VM.MemoryModel == VM.SC)
+    else if (VM.BuildForIA32 && (VM.MemoryModel == VM.SC)
         && VM.MemoryModel_NaiveImpl)
       IA32_SC_Naive(ir);
-    if (VM.BuildForIA32 && (VM.MemoryModel == VM.SC)
+    else if (VM.BuildForIA32 && (VM.MemoryModel == VM.SC)
         && !VM.MemoryModel_NaiveImpl)
       IA32_SC(ir);
-    if (VM.BuildForPowerPC && (VM.MemoryModel == VM.BMM)
+    else if (VM.BuildForPowerPC && (VM.MemoryModel == VM.BMM)
         && VM.MemoryModel_NaiveImpl)
       PPC_BMM_Naive(ir);
-    if (VM.BuildForPowerPC && (VM.MemoryModel == VM.BMM)
+    else if (VM.BuildForPowerPC && (VM.MemoryModel == VM.BMM)
         && !VM.MemoryModel_NaiveImpl)
       PPC_BMM(ir);
-    if (VM.BuildForPowerPC && (VM.MemoryModel == VM.SC)
+    else if (VM.BuildForPowerPC && (VM.MemoryModel == VM.SC)
         && VM.MemoryModel_NaiveImpl)
       PPC_SC_Naive(ir);
-    if (VM.BuildForPowerPC && (VM.MemoryModel == VM.SC)
+    else if (VM.BuildForPowerPC && (VM.MemoryModel == VM.SC)
         && !VM.MemoryModel_NaiveImpl)
       PPC_SC(ir);
-    VM._assert(VM.NOT_REACHED);
+    else
+      VM._assert(VM.NOT_REACHED, "Unknown config: MM [" + VM.MemoryModel
+          + "] Naive[" + VM.MemoryModel_NaiveImpl + "]");
   }
 
   private void IA32_BMM_Naive(IR ir) {
@@ -76,7 +108,13 @@ public class EnforceMemMod extends CompilerPhase {
     BasicBlock curBlock = ir.cfg.entry();
     worklist.push(curBlock);
     BBInfo_IA32_SC_Naive curBBInfo = null;
-    while ((curBlock = worklist.pop()) != null) {
+    while (!worklist.isEmpty()) {
+      curBlock = worklist.pop();
+      if (curBlock.isExit())
+        continue;
+      if (DEBUG_IA32_SC_NAIVE) {
+        VM.sysWriteln("Processing: " + curBlock);
+      }
       // if a fence should be placed before hitting the next load. This is only
       // true when there are previously open stores (open store: there is no
       // load or sync instruction between from the store to the current point )
@@ -90,55 +128,74 @@ public class EnforceMemMod extends CompilerPhase {
         curBBInfo.processed = true;
         shouldFence = curBBInfo.shouldFenceEntry;
         // only load, store, and sync concerned
-        boolean isFirstInst = true;
+        boolean isFirstConcernedInst = true;
         for (Instruction inst = curBlock.firstInstruction(); inst != curBlock
             .lastInstruction(); inst = inst.nextInstructionInCodeOrder()) {
-          if (LocalCSE.isJavaLoad(inst)) {
-            if (isFirstInst) {
-              curBBInfo.loadFirst = true;
-            }
-            // a load should be fenced before if there is open store
+          if (DEBUG_IA32_SC_NAIVE) {
+            VM.sysWrite("\tinst: " + inst.toString());
+          }
+          if (LocalCSE.isJavaLoad(inst) || inst.getOpcode() == RETURN_opcode
+              || inst.getOpcode() == ATHROW_opcode
+              || inst.getOpcode() == CALL_opcode) {
+            // a load should be fenced if there is open store
+            // return, throw, and call should be conservatively fenced
             if (shouldFence) {
               inst.insertBefore(Empty.create(FENCE));
               shouldFence = false;
+              if (DEBUG_IA32_SC_NAIVE) {
+                VM.sysWrite("\t <-- fence before ");
+              }
             }
-            curBBInfo.noLoadStore = false;
+            if (isFirstConcernedInst) {
+              curBBInfo.loadFirst = true;
+            }
+            curBBInfo.noMemAcc = false;
+            isFirstConcernedInst = false;
           } else if (LocalCSE.isJavaStore(inst)) {
             // a new open store
             shouldFence = true;
-            curBBInfo.noLoadStore = false;
+            curBBInfo.noMemAcc = false;
+            isFirstConcernedInst = false;
           } else if (inst.getOpcode() == MONITORENTER_opcode ||
               inst.getOpcode() == MONITOREXIT_opcode ||
               inst.getOpcode() == FENCE_opcode) {
-            // these instructions provide full fence semantics, so previous
-            // store is closed if it is open
+            // syncs close previous stores by providing full fence semantics 
             shouldFence = false;
-            curBBInfo.noLoadStore = false;
+            curBBInfo.noMemAcc = false;
+            isFirstConcernedInst = false;
           }
-          if (isFirstInst) {
-            isFirstInst = false;
+          if (DEBUG_IA32_SC_NAIVE) {
+            VM.sysWriteln();
           }
         }
       }
+      if (DEBUG_IA32_SC_NAIVE) {
+        VM.sysWriteln("\tInfo: [ " + curBBInfo
+            + (shouldFence ? "shouldFence ]" : "]"));
+      }
+
       // now the current BB is processed, take care of its successors
       Enumeration<BasicBlock> outs = curBlock.getOut();
       while (outs.hasMoreElements()) {
         BasicBlock outBB = outs.nextElement();
         curBBInfo = bbInfo[outBB.getIndex()];
         if (!curBBInfo.processed) {
-          // if the successor is not processed yet, put it in the work list
+          // if the successor is not processed yet, process as normally
           curBBInfo.shouldFenceEntry = shouldFence;
           worklist.push(outBB);
+          if (DEBUG_IA32_SC_NAIVE) {
+            VM.sysWriteln("Push: " + outBB);
+          }
         } else if (shouldFence) {
           // it is processed already, but we have new fence request ...
-          if (outBB == ir.cfg.exit()) {
-            // conservatively insert a fence at the exit of the function
-            curBlock.appendInstruction(Empty.create(FENCE));
-          } else if (curBBInfo.loadFirst) {
+          if (curBBInfo.loadFirst) {
             // put a fence to close the store against a following load
             outBB.prependInstruction(Empty.create(FENCE));
             curBBInfo.loadFirst = false;
-          } else if (curBBInfo.noLoadStore
+            if (DEBUG_IA32_SC_NAIVE) {
+              VM.sysWriteln("Revisit: " + outBB + " by prepending a fence");
+            }
+          } else if (curBBInfo.noMemAcc
               && !curBBInfo.shouldFenceEntry) {
             // if there is no load, store, or sync in the successor, it just
             // passed over the fencing request. Since we changed it, all its
@@ -146,6 +203,10 @@ public class EnforceMemMod extends CompilerPhase {
             // where a BB being put in the work list twice.
             curBBInfo.shouldFenceEntry = true;
             worklist.push(outBB);
+            if (DEBUG_IA32_SC_NAIVE) {
+              VM.sysWriteln("Revisit: " + outBB
+                  + " by pushing back to work list");
+            }
           }
         }
       }
@@ -175,7 +236,15 @@ public class EnforceMemMod extends CompilerPhase {
   private static final class BBInfo_IA32_SC_Naive {
     boolean processed = false;
     boolean loadFirst = false;
-    boolean noLoadStore = true;
+    boolean noMemAcc = true;
     boolean shouldFenceEntry = false;
+
+    public String toString() {
+      String s = "";
+      s += loadFirst ? "loadFirst " : "";
+      s += noMemAcc ? "noMemAcc " : "";
+      s += shouldFenceEntry ? "shouldFenceEntry " : "";
+      return s;
+    }
   }
 }
